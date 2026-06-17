@@ -1,4 +1,3 @@
-
 <div id="root"></div>
 <script>
 // ===================== SCORING =====================
@@ -59,6 +58,34 @@ function parseFeed(raw){
     series:(j.series_id!=null?String(j.series_id):''),
     cautionSegments:(typeof j.number_of_caution_segments==='number')?j.number_of_caution_segments:null,
     stageNum:(j.stage&&typeof j.stage.stage_num==='number')?j.stage.stage_num:null};
+}
+
+// race_list_basic.json (or schedule) — find latest PAST race_id (date<=now), else max id.
+function parseSchedule(raw){
+  let j=JSON.parse(raw);
+  // races can be a top-level array, or under common keys, or a map keyed by series
+  let races=null;
+  if(Array.isArray(j)) races=j;
+  else if(Array.isArray(j.races)) races=j.races;
+  else if(Array.isArray(j.schedule)) races=j.schedule;
+  else if(typeof j==='object'){
+    // sometimes keyed by series id -> array
+    for(const k in j){ if(Array.isArray(j[k])){ races=j[k]; break; } }
+  }
+  if(!races||!races.length) throw new Error('массив гонок не найден');
+  const now=Date.now();
+  const norm=races.map(r=>{
+    const id = r.race_id ?? r.RaceID ?? r.id ?? r.raceId;
+    const dStr = r.race_date ?? r.date_scheduled ?? r.scheduled ?? r.start_time ?? r.race_date_scheduled ?? r.date;
+    const t = dStr?Date.parse(dStr):NaN;
+    return {id:(id!=null?Number(id):NaN), t:isNaN(t)?null:t, name:(r.race_name??r.name??'')};
+  }).filter(r=>!isNaN(r.id));
+  if(!norm.length) throw new Error('race_id в расписании не найден');
+  // prefer races whose date already passed; pick the one with the latest past date
+  const past=norm.filter(r=>r.t!=null && r.t<=now).sort((a,b)=>b.t-a.t);
+  if(past.length) return past[0];
+  // fallback: highest race_id
+  return norm.slice().sort((a,b)=>b.id-a.id)[0];
 }
 
 // live-points.json — points_earned_this_race per car number
@@ -176,6 +203,23 @@ function render(){
       el('option',{value:'3',...(state.series==='3'?{selected:'selected'}:{})},'3 · Trucks'))));
   params.appendChild(el('div',{class:'pgrp'},el('label',{},'race_id'),
     el('input',{class:'pin',placeholder:'напр. 5614',value:state.raceId,oninput:e=>{state.raceId=e.target.value.trim();},onchange:e=>{state.raceId=e.target.value.trim();saveState(state);render();}})));
+  params.appendChild(el('div',{class:'pgrp'},el('label',{},'\u00A0'),
+    el('button',{class:'fill',onclick:async(ev)=>{
+      const btn=ev.target;const old=btn.textContent;btn.textContent='…';btn.disabled=true;
+      try{
+        const raw=await fetchFeed(L.schedule);
+        const r=parseSchedule(raw);
+        state.raceId=String(r.id); saveState(state); render();
+        setTimeout(()=>alert(`Подставлен race_id: ${r.id}`+(r.name?`\nГонка: ${r.name}`:'')),50);
+      }catch(e){
+        btn.textContent=old;btn.disabled=false;
+        const paste=prompt('Не удалось загрузить расписание автоматически ('+e.message+').\n\nОткройте ссылку «① Расписание», скопируйте весь JSON и вставьте сюда:');
+        if(paste&&paste.trim()){
+          try{const r=parseSchedule(paste);state.raceId=String(r.id);saveState(state);render();alert(`Подставлен race_id: ${r.id}`+(r.name?`\nГонка: ${r.name}`:''));}
+          catch(err){alert('Ошибка разбора расписания: '+err.message);}
+        }
+      }
+    }},'Подставить race_id')));
   src.appendChild(params);
 
   function linkRow(label,url,note,ready){
@@ -325,6 +369,9 @@ function render(){
   .pgrp{display:flex;flex-direction:column;gap:4px;}
   .pgrp label{font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);}
   .pin{background:var(--field);border:1px solid var(--line);border-radius:6px;color:#fff;font-family:inherit;font-size:13px;padding:7px 10px;width:120px;}
+  .fill{background:var(--field);border:1px solid var(--yellow);color:var(--yellow);font-family:inherit;font-size:12px;font-weight:600;padding:7px 12px;border-radius:6px;cursor:pointer;white-space:nowrap;}
+  .fill:hover{background:var(--yellow);color:#16181d;}
+  .fill:disabled{opacity:.6;cursor:default;}
   .pin:focus{outline:none;border-color:var(--yellow);}
   .lrow{padding:8px 0;border-bottom:1px solid var(--line);}
   .lrow:last-of-type{border-bottom:none;}
