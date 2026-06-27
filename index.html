@@ -1,30 +1,40 @@
 <div id="root"></div>
 <script>
 // ===================== SCORING =====================
-function qualPoints(place){const p=parseInt(place,10);if(!p||p<1)return 0;if(p===1)return 40;if(p===2)return 35;return Math.max(0,37-p);}
-function diffPoints(diff){const d=Math.abs(parseInt(diff,10));const s=[10,7,5,3,1,0];if(isNaN(d))return 0;return d>=5?0:s[d];}
+// Qualifying position points: P1=40, P2=35, P3-P36=37-p, P37+=0
+function qualPoints(place){const p=parseInt(place,10);if(!p||p<1)return 0;if(p===1)return 40;if(p===2)return 35;const v=37-p;return v>0?v:0;}
+function diffPoints(diff){const d=Math.abs(parseInt(diff,10));const s=[10,7,5,3,2,1,0];if(isNaN(d))return 0;return d>=6?0:s[d];}
 function mfgPoints(place){const p=parseInt(place,10);if(!p||p<1||p>10)return 0;return 11-p;}
-// Место участника в квал-зачёте конкурса: 1→20, 2→19, пары 3-4→18..35-36→2, 37-40→1, 41+→0
-function qualResultPoints(place){const p=parseInt(place,10);if(!p||p<1)return 0;if(p===1)return 20;if(p===2)return 19;if(p>=37&&p<=40)return 1;if(p>=41)return 0;const v=18-Math.floor((p-3)/2);return v>0?v:0;}
+// NASCAR 2026 race points: P1=55, P2=35, P3=34 ... P36=1, P37+=0
+function finishPoints(pos){const p=parseInt(pos,10);if(!p||p<1)return 0;if(p===1)return 55;if(p<=36)return 37-p;return 1;}
+// Stage points from finishing_position within stage: P1=10, P2=9 ... P10=1, else 0
+function stagePointFromPos(pos){const p=parseInt(pos,10);if(!p||p<1||p>10)return 0;return 11-p;}
+// Normalise manufacturer name to internal key
+const MFG_NORM={'chevrolet':'Chv','ford':'Frd','toyota':'Tyt','chv':'Chv','frd':'Frd','tyt':'Tyt'};
+function normMfg(m){return MFG_NORM[(m||'').toLowerCase()]||m;}
+// Место участника в квал-зачёте конкурса: 1→20, 2-3→19, 4-5→18, 6-7→17 ... пары вниз до 0
+function qualResultPoints(place){const p=parseInt(place,10);if(!p||p<1)return 0;if(p===1)return 20;const v=19-Math.floor((p-2)/2);return v>0?v:0;}
 const MFG_NAMES={Chv:'Chevrolet',Frd:'Ford',Tyt:'Toyota'};
 const num=x=>x==null?'':String(x);
 function normName(s){return (s||'').toLowerCase().replace(/[^a-zа-я0-9]+/gi,' ').trim();}
 
 // ===================== STORAGE =====================
-const STORE_KEY='nascar_pred_v4';
+const STORE_KEY='nascar_pred_v5';
 async function loadState(){try{const r=await window.storage.get(STORE_KEY);return r?JSON.parse(r.value):null;}catch(e){return null;}}
 async function saveState(s){try{await window.storage.set(STORE_KEY,JSON.stringify(s));}catch(e){}}
 
 function newParticipant(name){return {name:name||'Участник',drivers:[null,null,null,null],qualResultPlace:'',predCaution:'',predRet:'',mfg:''};}
 const DEFAULT={
-  raceName:'', feedRaw:'', pointsRaw:'',
+  raceName:'', weekendRaw:'', feedRaw:'', pointsRaw:'',
   year:'2026', series:'1', raceId:'',
   qualRoster:[], raceRoster:[], pointsByNum:{},
   cautionSegmentsRace:null, stageNumRace:null,
+  weekendCautions:null, weekendRet:null,
   actualCaution:'', actualRet:'',           // shared actuals (auto from feed, editable)
   participants:[newParticipant('Участник 1'),newParticipant('Участник 2')]
 };
 let state=null;
+let raceListCache=null;let raceListCacheKey='';
 
 // ===================== PARSERS =====================
 function cleanName(s){return (s||'').replace(/^[*#\s]+/,'').replace(/\s*[#(].*$/,'').trim();}
@@ -66,6 +76,20 @@ function parseSchedule(raw){
   return norm.slice().sort((a,b)=>b.id-a.id)[0];
 }
 
+function parseRaceList(raw){
+  let j=JSON.parse(raw);let races=null;
+  if(Array.isArray(j))races=j;else if(Array.isArray(j.races))races=j.races;
+  else if(Array.isArray(j.schedule))races=j.schedule;
+  else if(typeof j==='object'){for(const k in j){if(Array.isArray(j[k])){races=j[k];break;}}}
+  if(!races||!races.length)throw new Error('массив гонок не найден');
+  return races.map(r=>{
+    const id=r.race_id??r.RaceID??r.id??r.raceId;
+    const dStr=r.race_date??r.date_scheduled??r.scheduled??r.start_time??r.date;
+    const t=dStr?Date.parse(dStr):NaN;
+    return {id:(id!=null?Number(id):NaN),t:isNaN(t)?null:t,name:(r.race_name??r.name??'')};
+  }).filter(r=>!isNaN(r.id)).sort((a,b)=>(a.t||0)-(b.t||0));
+}
+
 function parsePoints(raw){
   const j=JSON.parse(raw);
   const arr=Array.isArray(j)?j:(j.vehicles||j.drivers||j.points||[]);
@@ -74,9 +98,73 @@ function parsePoints(raw){
   return map;
 }
 
+function parseWeekendFeed(raw){
+  const j=JSON.parse(raw);
+  const wr=(Array.isArray(j.weekend_race)&&j.weekend_race[0])||j;
+  const results=Array.isArray(wr.results)?wr.results:[];
+
+  // Qualifying positions from weekend_runs where run_type=2
+  const qualRun=(j.weekend_runs||[]).find(r=>r.run_type===2);
+  const qualPosMap={};
+  if(qualRun&&Array.isArray(qualRun.results)){
+    qualRun.results.forEach(r=>{
+      const n=String(r.car_number||r.vehicle_number);
+      qualPosMap[n]=r.finishing_position;
+    });
+  }
+
+  // Stage points per car: finishing_position within each stage → P1=10..P10=1
+  const stagePts={};
+  (wr.stage_results||[]).forEach(stage=>{
+    (stage.results||[]).forEach(sr=>{
+      const n=String(sr.car_number);
+      stagePts[n]=(stagePts[n]||0)+stagePointFromPos(sr.finishing_position);
+    });
+  });
+
+  // Build rosters and compute combined points
+  const pointsByNum={};
+  const raceRoster=[];
+  const qualRoster=[];
+  results.forEach(r=>{
+    const num=String(r.car_number);
+    const name=r.driver_fullname||('#'+num);
+    const mfg=normMfg(r.car_make);
+    const isRunning=(r.finishing_status||'').toLowerCase()==='running';
+    raceRoster.push({num,name,mfg,running:r.finishing_position,status:isRunning?1:0,onTrack:false});
+    const qpos=qualPosMap[num]??null;
+    if(qpos!=null) qualRoster.push({num,name,mfg,running:qpos,status:1,onTrack:false});
+    pointsByNum[num]=(stagePts[num]||0)+finishPoints(r.finishing_position);
+  });
+
+  // Cautions: caution_segments where reason != "Competition"
+  const cautions=(wr.caution_segments||[]).filter(c=>c.reason!=='Competition').length;
+
+  // Retirements: results where finishing_status != "Running"
+  const ret=results.filter(r=>(r.finishing_status||'').toLowerCase()!=='running').length;
+
+  return {raceRoster,qualRoster,pointsByNum,
+    raceName:wr.race_name||'',
+    raceId:wr.race_id!=null?String(wr.race_id):'',
+    series:wr.series_id!=null?String(wr.series_id):'',
+    cautions,ret};
+}
+function applyWeekendFeed(raw){
+  const p=parseWeekendFeed(raw);
+  if(!state.raceName&&p.raceName)state.raceName=p.raceName;
+  if(p.raceId)state.raceId=p.raceId;
+  if(p.series)state.series=p.series;
+  state.raceRoster=p.raceRoster;
+  state.qualRoster=p.qualRoster;
+  state.pointsByNum=p.pointsByNum;
+  if(p.cautions!=null)state.weekendCautions=p.cautions;
+  state.weekendRet=p.ret;
+}
+
 function feedLinks(year,series,raceId){
   const base=`https://cf.nascar.com/live/feeds/series_${series}/${raceId}`;
   return {schedule:`https://cf.nascar.com/cacher/${year}/${series}/race_list_basic.json`,
+    weekend:`https://cf.nascar.com/cacher/${year}/${series}/${raceId}/weekend-feed.json`,
     live:`${base}/live_feed.json`,livePoints:`${base}/live-points.json`,livePage:`https://www.nascar.com/live-results/`};
 }
 async function fetchFeed(url){const res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);return await res.text();}
@@ -111,72 +199,93 @@ function driverData(numv){
     onTrack:r?r.onTrack:null};
 }
 // auto actuals from race feed
-function autoCautions(){ if(state.cautionSegmentsRace!=null&&state.stageNumRace!=null) return state.cautionSegmentsRace-state.stageNumRace+1; return null; }
-function autoRetirements(){ if(!state.raceRoster.length) return null; let n=0; state.raceRoster.forEach(d=>{if(d.status!=null && Number(d.status)!==1)n++;}); return n; }
+function autoCautions(){ if(state.weekendCautions!=null)return state.weekendCautions; if(state.cautionSegmentsRace!=null&&state.stageNumRace!=null) return state.cautionSegmentsRace-state.stageNumRace+1; return null; }
+function autoRetirements(){ if(state.weekendRet!=null)return state.weekendRet; if(!state.raceRoster.length) return null; let n=0; state.raceRoster.forEach(d=>{if(d.status!=null && Number(d.status)!==1)n++;}); return n; }
 function effCaution(){ return state.actualCaution!==''?+state.actualCaution:(autoCautions()!=null?autoCautions():null); }
 function effRet(){ return state.actualRet!==''?+state.actualRet:(autoRetirements()!=null?autoRetirements():null); }
 // best finish for a manufacturer (race feed)
 function mfgBestFinish(mfgCode){ if(!mfgCode||!state.raceRoster.length)return null; let best=null; state.raceRoster.forEach(d=>{if(d.mfg===mfgCode&&d.running>0){if(best===null||d.running<best)best=d.running;}}); return best; }
 
 // ===================== PER-PARTICIPANT SCORING =====================
-function scoreParticipant(p){
-  let qualSum=0, raceDriverSum=0;
-  const rows=p.drivers.map(numv=>{
-    const d=driverData(numv);
-    const qp=d&&d.qualPlace?d.qualPlace:'';
-    const qpts=qualPoints(qp);
-    qualSum+=qpts;
-    const rpl=d&&d.racePlace?d.racePlace:'';
-    const rpts=(d&&d.points!=null)?d.points:0;
-    raceDriverSum+=rpts;
-    return {name:d?d.name:'', qualPlace:qp, qualPts:qpts, racePlace:rpl, racePts:(d&&d.points!=null)?d.points:''};
-  });
-  // bonuses
+// Competition ranking (1-2-2-4): ties share the same rank
+function computeRanks(scores){
+  const sorted=[...scores].sort((a,b)=>b-a);
+  return scores.map(s=>sorted.indexOf(s)+1);
+}
+
+function computeAllScores(participants){
   const ec=effCaution(), er=effRet();
-  const cauPts=(p.predCaution===''||ec==null)?0:diffPoints(p.predCaution-ec);
-  const retPts=(p.predRet===''||er==null)?0:diffPoints(p.predRet-er);
-  const mfgFin=mfgBestFinish(p.mfg);
-  const mPts=mfgPoints(mfgFin);
-  const qrPts=qualResultPoints(p.qualResultPlace);
-  const raceTotal=raceDriverSum+cauPts+retPts+mPts+qrPts;
-  return {rows,qualSum,raceDriverSum,cauPts,retPts,mfgFin,mPts,qrPts,raceTotal,grand:qualSum+raceTotal,
-    ec,er};
+  // Pass 1: qual sums + driver rows
+  const pass1=participants.map(p=>{
+    let qualSum=0;
+    const rows=p.drivers.map(numv=>{
+      const d=driverData(numv);
+      const qp=d&&d.qualPlace?d.qualPlace:'';
+      const qpts=qualPoints(qp);
+      qualSum+=qpts;
+      return {name:d?d.name:'',qualPlace:qp,qualPts:qpts,
+        racePlace:d&&d.racePlace?d.racePlace:'',
+        racePts:(d&&d.points!=null)?d.points:''};
+    });
+    return {qualSum,rows};
+  });
+  // Pass 2: rank participants by qual score → qual result points
+  const qualRanks=computeRanks(pass1.map(q=>q.qualSum));
+  // Pass 3: full scores
+  return participants.map((p,i)=>{
+    const {qualSum,rows}=pass1[i];
+    const qualRank=qualRanks[i];
+    const effectiveRank=p.qualResultPlace!==''&&!isNaN(+p.qualResultPlace)?+p.qualResultPlace:qualRank;
+    const qrPts=qualResultPoints(effectiveRank);
+    let raceDriverSum=0;
+    rows.forEach(r=>{raceDriverSum+=(r.racePts!==''?+r.racePts:0);});
+    const cauPts=(p.predCaution===''||ec==null)?0:diffPoints(p.predCaution-ec);
+    const retPts=(p.predRet===''||er==null)?0:diffPoints(p.predRet-er);
+    const mfgFin=mfgBestFinish(p.mfg);
+    const mPts=mfgPoints(mfgFin);
+    const raceTotal=raceDriverSum+cauPts+retPts+mPts;
+    return {rows,qualSum,qualRank,qrPts,raceDriverSum,cauPts,retPts,mfgFin,mPts,raceTotal,
+      grand:qrPts+raceTotal,ec,er};
+  });
 }
 
 // ===================== UI HELPERS =====================
 function el(t,a={},...k){const e=document.createElement(t);for(const x in a){if(x==='class')e.className=a[x];else if(x==='html')e.innerHTML=a[x];else if(x.startsWith('on'))e.addEventListener(x.slice(2).toLowerCase(),a[x]);else if(a[x]!=null)e.setAttribute(x,a[x]);}k.flat().forEach(c=>{if(c==null)return;e.appendChild(typeof c==='string'?document.createTextNode(c):c);});return e;}
 
-// searchable driver combobox
+// ===================== UI HELPERS =====================
 let openCombo=null;
-function driverCombo(pi,di){
+
+// compact driver combo: small input (#NUM lastName), dropdown on focus
+function driverComboCompact(pi,di,srow){
   const cur=state.participants[pi].drivers[di];
   const curD=cur?driverData(cur):null;
-  const wrap=el('div',{class:'combo'});
-  const input=el('input',{class:'cinput',placeholder:'— пилот —',value:curD?curD.name:'',
+  function shortName(d){if(!d)return '';const parts=(d.name||'').split(' ');return '#'+d.num+' '+(parts[parts.length-1]||'');}
+  const wrap=el('div',{class:'combo-c'});
+  const input=el('input',{class:'cinput-c',placeholder:'—',
+    value:shortName(curD),title:curD?curD.name:'',
     onfocus:e=>{e.target.select();showList('');},
     oninput:e=>{showList(e.target.value);}});
   const list=el('div',{class:'clist',style:'display:none'});
-  function pick(d){
-    state.participants[pi].drivers[di]=d?d.num:null;
-    saveState(state); render();
-  }
+  function pick(d){state.participants[pi].drivers[di]=d?d.num:null;saveState(state);render();}
   function showList(filter){
-    if(openCombo&&openCombo!==list) openCombo.style.display='none';
-    openCombo=list;
-    list.innerHTML=''; list.style.display='block';
-    const f=normName(filter);
-    const items=combinedRoster().filter(d=>!f||normName(d.name).includes(f)||d.num.includes(filter.trim()))
-      .sort((a,b)=>a.name.localeCompare(b.name)).slice(0,60);
-    if(!items.length){list.appendChild(el('div',{class:'cempty'},'нет совпадений'));}
-    items.forEach(d=>{
-      list.appendChild(el('div',{class:'citem',onmousedown:ev=>{ev.preventDefault();pick(d);}},`#${d.num} ${d.name}`));
-    });
-    // clear option
-    if(cur) list.insertBefore(el('div',{class:'citem clear',onmousedown:ev=>{ev.preventDefault();pick(null);}},'× очистить'),list.firstChild);
+    if(openCombo&&openCombo!==list)openCombo.style.display='none';
+    openCombo=list;list.innerHTML='';list.style.display='block';
+    const raw=filter.replace(/^#/,'').trim();
+    const f=normName(raw);
+    const items=combinedRoster().filter(d=>!f||normName(d.name).includes(f)||d.num.startsWith(raw)||d.num===raw)
+      .sort((a,b)=>+a.num-+b.num).slice(0,60);
+    if(!items.length)list.appendChild(el('div',{class:'cempty'},'нет'));
+    items.forEach(d=>list.appendChild(el('div',{class:'citem',onmousedown:ev=>{ev.preventDefault();pick(d);}},`#${d.num} ${d.name}`)));
+    if(cur)list.insertBefore(el('div',{class:'citem clear',onmousedown:ev=>{ev.preventDefault();pick(null);}},'× очистить'),list.firstChild);
   }
-  input.addEventListener('blur',()=>{ setTimeout(()=>{list.style.display='none'; // restore display name if left half-typed
-    const d=cur?driverData(cur):null; input.value=d?d.name:''; },150); });
-  wrap.appendChild(input); wrap.appendChild(list);
+  input.addEventListener('blur',()=>{setTimeout(()=>{list.style.display='none';
+    const d=cur?driverData(cur):null;input.value=shortName(d);input.title=d?d.name:'';},150);});
+  // score meta line
+  const meta=[];
+  if(srow.qualPlace!=='')meta.push('Q'+srow.qualPlace+' +'+srow.qualPts);
+  if(srow.racePts!=='')meta.push(srow.racePts+'п');
+  wrap.appendChild(input);wrap.appendChild(list);
+  if(meta.length)wrap.appendChild(el('div',{class:'cmeta'},meta.join(' · ')));
   return wrap;
 }
 
@@ -186,94 +295,130 @@ function mfgSelect(pi){
     el('option',{value:''},'—'),
     ...['Chv','Frd','Tyt'].map(m=>el('option',{value:m,...(cur===m?{selected:'selected'}:{})},MFG_NAMES[m])));
 }
-function predInput(pi,key){
-  const v=state.participants[pi][key];
-  return el('input',{class:'pred',type:'number',min:'0',placeholder:'—',value:v,
-    oninput:e=>{state.participants[pi][key]=e.target.value;saveState(state);},
-    onchange:e=>{state.participants[pi][key]=e.target.value;saveState(state);render();}});
-}
 
 // ===================== RENDER =====================
 function render(){
   const root=document.getElementById('root');root.innerHTML='';
   const P=state.participants;
-  const scores=P.map(scoreParticipant);
+  const ec=effCaution(),er=effRet();
 
-  // ---------- header ----------
+  const scores=computeAllScores(P);
+  const ranked=P.map((_,i)=>i);
+
+  // header
   root.appendChild(el('div',{class:'hd'},el('div',{class:'flag'}),
     el('div',{class:'htxt'},el('h1',{},'NASCAR · Прогнозы сокомандников'),
       el('input',{class:'race',placeholder:'Название гонки',value:state.raceName,oninput:e=>{state.raceName=e.target.value;saveState(state);}}))));
 
-  // ---------- sources ----------
   renderSources(root);
 
-  // ---------- main comparison table ----------
+  // ---- participants table ----
   const card=el('section',{class:'card tablecard'});
-  const tbl=el('div',{class:'gt',style:`grid-template-columns:150px repeat(${P.length},minmax(120px,1fr));`});
 
-  // header row: participant names + remove
-  tbl.appendChild(el('div',{class:'gc ghead glabelcell'},'Гонщик'));
-  P.forEach((p,pi)=>{
-    tbl.appendChild(el('div',{class:'gc ghead'},
-      el('input',{class:'pname',value:p.name,oninput:e=>{p.name=e.target.value;saveState(state);},onchange:e=>{p.name=e.target.value;saveState(state);render();}}),
-      P.length>1?el('button',{class:'xdel',title:'удалить',onclick:()=>{if(confirm('Удалить участника?')){state.participants.splice(pi,1);saveState(state);render();}}},'×'):null));
-  });
+  // summary bar
+  const sumbar=el('div',{class:'sumbar'});
+  sumbar.appendChild(el('span',{class:'sumitem'},'Участников: '+P.length));
+  if(ec!=null)sumbar.appendChild(el('span',{class:'sumitem fact-hd'},'Жёлтые: '+ec));
+  if(er!=null)sumbar.appendChild(el('span',{class:'sumitem fact-hd'},'Сходы: '+er));
+  card.appendChild(sumbar);
 
-  // QUALIFYING block: Driver 1..4 (combo + place + pts)
-  for(let di=0;di<4;di++){
-    tbl.appendChild(el('div',{class:'gc glabelcell'},'Пилот '+(di+1)));
-    P.forEach((p,pi)=>{
-      const s=scores[pi].rows[di];
-      tbl.appendChild(el('div',{class:'gc cellpick'},
-        driverCombo(pi,di),
-        el('div',{class:'qpair'},
-          el('span',{class:'qplace'}, s.qualPlace!==''?String(s.qualPlace):'—'),
-          el('span',{class:'qpts'}, String(s.qualPts)))));
-    });
-  }
-  // Qualification sum
-  tbl.appendChild(el('div',{class:'gc glabelcell strong'},'Квалификация'));
-  P.forEach((p,pi)=>tbl.appendChild(el('div',{class:'gc sumcell'},String(scores[pi].qualSum))));
+  const wrap=el('div',{class:'tscroll'});
+  const tbl=el('table',{class:'ptbl'});
 
-  // spacer
-  tbl.appendChild(el('div',{class:'gc spacer',style:`grid-column:1/${P.length+2};`},''));
+  // thead
+  const htr=el('tr',{},
+    el('th',{class:'th-rank'},'#'),
+    el('th',{class:'th-name'},'Имя'),
+    el('th',{class:'th-drv'},'Пилот 1'),
+    el('th',{class:'th-drv'},'Пилот 2'),
+    el('th',{class:'th-drv'},'Пилот 3'),
+    el('th',{class:'th-drv'},'Пилот 4'),
+    el('th',{class:'th-n',title:'Автоматический ранг в квалификации → очки'},'Ркв.'),
+    el('th',{class:'th-n',title:'Жёлтые флаги'+(ec!=null?' (факт '+ec+')':'')},'Жёлт.',ec!=null?el('span',{class:'fact-hd'},' '+ec):null),
+    el('th',{class:'th-n',title:'Сходы'+(er!=null?' (факт '+er+')':'')},'Сходы',er!=null?el('span',{class:'fact-hd'},' '+er):null),
+    el('th',{class:'th-mfg'},'Произв.'),
+    el('th',{class:'th-pts',title:'Очки за квалификацию'},'Кв.'),
+    el('th',{class:'th-pts',title:'Очки за гонку'},'Гонка'),
+    el('th',{class:'th-total'},'Итого'),
+    el('th',{class:'th-del'})
+  );
+  tbl.appendChild(el('thead',{},htr));
 
-  // Результат квалификации (место участника в квал-зачёте)
-  tbl.appendChild(el('div',{class:'gc glabelcell'},'Результат квалификации'));
-  P.forEach((p,pi)=>tbl.appendChild(el('div',{class:'gc cellbonus'},
-    el('input',{class:'pred',type:'number',min:'1',placeholder:'место',value:p.qualResultPlace,
+  const tbody=el('tbody');
+  ranked.forEach((pi,rank)=>{
+    const p=P[pi];const s=scores[pi];
+    const racePtsTot=s.raceTotal;
+    const tr=el('tr',{class:'prow'+(rank===0&&s.grand>0?' p1':'')+(rank%2===1?' alt':'')});
+
+    tr.appendChild(el('td',{class:'td-rank'},String(rank+1)));
+
+    // name
+    const ntd=el('td',{class:'td-name'});
+    ntd.appendChild(el('input',{class:'pname-c',value:p.name,
+      oninput:e=>{p.name=e.target.value;saveState(state);},
+      onchange:e=>{p.name=e.target.value;saveState(state);render();}}));
+    tr.appendChild(ntd);
+
+    // 4 drivers
+    for(let di=0;di<4;di++){
+      const td=el('td',{class:'td-drv'});
+      td.appendChild(driverComboCompact(pi,di,s.rows[di]));
+      tr.appendChild(td);
+    }
+
+    // qual rank (auto) with manual override
+    const qrtd=el('td',{class:'td-n'});
+    const autoRank=s.qualRank;
+    const overrideVal=p.qualResultPlace;
+    const effectiveRank=overrideVal!==''&&!isNaN(+overrideVal)?+overrideVal:autoRank;
+    const effectivePts=qualResultPoints(effectiveRank);
+    qrtd.appendChild(el('div',{class:'qrank-auto',title:'Авто: #'+autoRank+(overrideVal!==''?' → ручной #'+overrideVal:'')},'#'+effectiveRank));
+    const ovr=el('input',{class:'n-inp',type:'number',min:'1',placeholder:'авто',value:overrideVal,
+      title:'Ручная корректировка ранга',
       oninput:e=>{p.qualResultPlace=e.target.value;saveState(state);},
-      onchange:e=>{p.qualResultPlace=e.target.value;saveState(state);render();}}),
-    el('span',{class:'bpts'},String(scores[pi].qrPts)))));
-  for(let di=0;di<4;di++){
-    tbl.appendChild(el('div',{class:'gc glabelcell'},'Пилот '+(di+1)));
-    P.forEach((p,pi)=>{
-      const s=scores[pi].rows[di];
-      tbl.appendChild(el('div',{class:'gc cellrace'},
-        el('span',{class:'rname'}, s.name||'—'),
-        el('span',{class:'rpts'}, s.racePts!==''?String(s.racePts):'—')));
-    });
-  }
+      onchange:e=>{p.qualResultPlace=e.target.value;saveState(state);render();}});
+    qrtd.appendChild(ovr);
+    if(effectivePts)qrtd.appendChild(el('div',{class:'bpts-s'},'+'+effectivePts));
+    tr.appendChild(qrtd);
 
-  // Cautions
-  const ec=effCaution(), er=effRet();
-  tbl.appendChild(el('div',{class:'gc glabelcell'},'Жёлтые',el('span',{class:'fact'}, ec!=null?` факт ${ec}`:'')));
-  P.forEach((p,pi)=>tbl.appendChild(el('div',{class:'gc cellbonus'},predInput(pi,'predCaution'),el('span',{class:'bpts'},String(scores[pi].cauPts)))));
-  // Retirements
-  tbl.appendChild(el('div',{class:'gc glabelcell'},'Сходы',el('span',{class:'fact'}, er!=null?` факт ${er}`:'')));
-  P.forEach((p,pi)=>tbl.appendChild(el('div',{class:'gc cellbonus'},predInput(pi,'predRet'),el('span',{class:'bpts'},String(scores[pi].retPts)))));
-  // Manufacturer
-  tbl.appendChild(el('div',{class:'gc glabelcell'},'Производитель'));
-  P.forEach((p,pi)=>{const s=scores[pi];tbl.appendChild(el('div',{class:'gc cellbonus'},mfgSelect(pi),el('span',{class:'bpts'},`${s.mfgFin?('P'+s.mfgFin+' '):''}${s.mPts}`)));});
+    // cautions
+    const ctd=el('td',{class:'td-n'});
+    ctd.appendChild(el('input',{class:'n-inp',type:'number',min:'0',placeholder:'—',value:p.predCaution,
+      oninput:e=>{p.predCaution=e.target.value;saveState(state);},
+      onchange:e=>{p.predCaution=e.target.value;saveState(state);render();}}));
+    if(s.cauPts)ctd.appendChild(el('div',{class:'bpts-s'},'+'+s.cauPts));
+    tr.appendChild(ctd);
 
-  // Total
-  tbl.appendChild(el('div',{class:'gc glabelcell strong totallbl'},'ИТОГО'));
-  P.forEach((p,pi)=>tbl.appendChild(el('div',{class:'gc totalcell'},String(scores[pi].grand))));
+    // retirements
+    const rtd=el('td',{class:'td-n'});
+    rtd.appendChild(el('input',{class:'n-inp',type:'number',min:'0',placeholder:'—',value:p.predRet,
+      oninput:e=>{p.predRet=e.target.value;saveState(state);},
+      onchange:e=>{p.predRet=e.target.value;saveState(state);render();}}));
+    if(s.retPts)rtd.appendChild(el('div',{class:'bpts-s'},'+'+s.retPts));
+    tr.appendChild(rtd);
 
-  card.appendChild(tbl);
+    // mfg
+    const mtd=el('td',{class:'td-mfg'});
+    mtd.appendChild(mfgSelect(pi));
+    if(s.mPts)mtd.appendChild(el('div',{class:'bpts-s'},'+'+s.mPts+(s.mfgFin?' P'+s.mfgFin:'')));
+    tr.appendChild(mtd);
+
+    tr.appendChild(el('td',{class:'td-pts'},String(s.qualSum)));
+    tr.appendChild(el('td',{class:'td-pts'},String(racePtsTot)));
+    tr.appendChild(el('td',{class:'td-total'},String(s.grand)));
+
+    const dtd=el('td',{class:'td-del'});
+    if(P.length>1)dtd.appendChild(el('button',{class:'xdel',title:'удалить',onclick:()=>{
+      if(confirm('Удалить?')){state.participants.splice(pi,1);saveState(state);render();}
+    }},'×'));
+    tr.appendChild(dtd);
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+  card.appendChild(wrap);
   root.appendChild(card);
 
-  // add participant
   root.appendChild(el('div',{class:'addrow'},
     el('button',{class:'add',onclick:()=>{state.participants.push(newParticipant('Участник '+(P.length+1)));saveState(state);render();}},'+ участник'),
     el('button',{class:'io',onclick:()=>exportData()},'⤓ Экспорт JSON'),
@@ -284,15 +429,10 @@ function render(){
 // ===================== EXPORT / IMPORT =====================
 function exportData(){
   const payload={
-    _type:'nascar_pred', _version:5,
+    _type:'nascar_pred', _version:6,
     raceName:state.raceName, year:state.year, series:state.series, raceId:state.raceId,
     actualCaution:state.actualCaution, actualRet:state.actualRet,
-    participants:state.participants,
-    // сырые данные гонки — чтобы импорт был самодостаточным
-    feedRaw:state.feedRaw||'', pointsRaw:state.pointsRaw||'',
-    qualRoster:state.qualRoster||[], raceRoster:state.raceRoster||[],
-    pointsByNum:state.pointsByNum||{},
-    cautionSegmentsRace:state.cautionSegmentsRace, stageNumRace:state.stageNumRace
+    participants:state.participants
   };
   const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
@@ -318,20 +458,16 @@ function importData(){
         if(d.raceId!=null)state.raceId=d.raceId;
         if(d.actualCaution!=null)state.actualCaution=d.actualCaution;
         if(d.actualRet!=null)state.actualRet=d.actualRet;
-        // восстановить сырые данные гонки (самодостаточный импорт)
-        state.feedRaw=d.feedRaw||'';
-        state.pointsRaw=d.pointsRaw||'';
-        state.qualRoster=Array.isArray(d.qualRoster)?d.qualRoster:[];
-        state.raceRoster=Array.isArray(d.raceRoster)?d.raceRoster:[];
-        state.pointsByNum=(d.pointsByNum&&typeof d.pointsByNum==='object')?d.pointsByNum:{};
-        state.cautionSegmentsRace=(d.cautionSegmentsRace!=null)?d.cautionSegmentsRace:null;
-        state.stageNumRace=(d.stageNumRace!=null)?d.stageNumRace:null;
-        // если ростеры не сохранены, но есть сырой фид — разобрать его
-        if(!state.raceRoster.length && !state.qualRoster.length){
-          try{ if(state.feedRaw.trim()) applyFeed(state.feedRaw); }catch(e){}
-        }
-        if(!Object.keys(state.pointsByNum).length && state.pointsRaw.trim()){
-          try{ state.pointsByNum=parsePoints(state.pointsRaw); }catch(e){}
+        // Сброс результатов — данные загрузятся автоматически по raceId
+        state.weekendRaw=''; state.feedRaw=''; state.pointsRaw='';
+        state.qualRoster=[]; state.raceRoster=[]; state.pointsByNum={};
+        state.weekendCautions=null; state.weekendRet=null;
+        state.cautionSegmentsRace=null; state.stageNumRace=null;
+        if(state.raceId&&state.year&&state.series){
+          const wurl=feedLinks(state.year,state.series,state.raceId).weekend;
+          fetchFeed(wurl).then(wraw=>{
+            applyWeekendFeed(wraw); state.weekendRaw=wraw; saveState(state); render();
+          }).catch(()=>{});
         }
         // normalize participants (fill missing fields)
         state.participants=d.participants.map(p=>{
@@ -366,34 +502,56 @@ function renderSources(root){
       el('option',{value:'1',...(state.series==='1'?{selected:'selected'}:{})},'1 · Cup'),
       el('option',{value:'2',...(state.series==='2'?{selected:'selected'}:{})},'2 · Xfinity'),
       el('option',{value:'3',...(state.series==='3'?{selected:'selected'}:{})},'3 · Trucks'))));
-  params.appendChild(el('div',{class:'pgrp'},el('label',{},'race_id'),
-    el('input',{class:'pin',placeholder:'5614',value:state.raceId,oninput:e=>{state.raceId=e.target.value.trim();},onchange:e=>{state.raceId=e.target.value.trim();saveState(state);render();}})));
-  params.appendChild(el('div',{class:'pgrp'},el('label',{},'\u00A0'),
-    el('button',{class:'fill',onclick:async(ev)=>{const btn=ev.target,old=btn.textContent;btn.textContent='…';btn.disabled=true;
-      try{const raw=await fetchFeed(L.schedule);const r=parseSchedule(raw);state.raceId=String(r.id);saveState(state);render();setTimeout(()=>alert('race_id: '+r.id+(r.name?'\n'+r.name:'')),50);}
-      catch(e){btn.textContent=old;btn.disabled=false;const paste=prompt('Не удалось загрузить расписание автоматически. Откройте расписание гонок, скопируйте его и вставьте сюда:');if(paste&&paste.trim()){try{const r=parseSchedule(paste);state.raceId=String(r.id);saveState(state);render();}catch(err){alert('Не получилось распознать расписание');}}}
-    }},'Подставить race_id')));
+  // Race dropdown — auto-loads when year/series changes
+  const raceKey=state.year+'|'+state.series;
+  const raceGrp=el('div',{class:'pgrp'});
+  raceGrp.appendChild(el('label',{},'Гонка'));
+  const rSel=el('select',{class:'pin',style:'width:320px',
+    onchange:e=>{const v=e.target.value;if(!v)return;state.raceId=v;saveState(state);render();}});
+  const fillRaceSel=()=>{
+    while(rSel.firstChild)rSel.removeChild(rSel.firstChild);
+    if(!raceListCache||!raceListCache.length){
+      rSel.appendChild(el('option',{value:''},'Загрузка…'));
+    } else {
+      rSel.appendChild(el('option',{value:''},'— выберите гонку —'));
+      raceListCache.forEach(r=>{
+        const d=r.t?new Date(r.t).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric'}):'???';
+        const opt=el('option',{value:String(r.id),...(String(r.id)===state.raceId?{selected:'selected'}:{})},d+' – '+r.name);
+        rSel.appendChild(opt);
+      });
+    }
+  };
+  if(raceListCacheKey!==raceKey){
+    raceListCache=null;raceListCacheKey=raceKey;
+    fillRaceSel();
+    fetchFeed(L.schedule).then(raw2=>{raceListCache=parseRaceList(raw2);raceListCacheKey=raceKey;fillRaceSel();}).catch(()=>{});
+  } else {
+    fillRaceSel();
+  }
+  raceGrp.appendChild(rSel);
+  params.appendChild(raceGrp);
   src.appendChild(params);
 
   const ready=!!state.raceId;
   function linkRow(label,url,note,rdy){return el('div',{class:'lrow'},el('div',{class:'lhd'},el('span',{class:'lname'},label),note?el('span',{class:'lnote'},note):null,el('button',{class:'copy',onclick:()=>{navigator.clipboard&&navigator.clipboard.writeText(url);}},'копировать')),el('a',{class:'lnk'+(rdy?'':' dim2'),href:url,target:'_blank',rel:'noopener'},url));}
-  src.appendChild(linkRow('Данные гонки',L.live,'места, жёлтые, сходы',ready));
-  src.appendChild(linkRow('Очки пилотов',L.livePoints,'очки за гонку',ready));
+  src.appendChild(linkRow('Weekend Feed',L.weekend,'квалификация · стейджи · финиш · жёлтые · сходы',ready));
 
   const loadBtn=el('button',{class:'parse',disabled:ready?null:'disabled',onclick:async(ev)=>{
-    const btn=ev.target,old=btn.textContent;btn.textContent='Загрузка…';btn.disabled=true;let rep=[];
-    try{const t=await fetchFeed(L.live);const ft=applyFeed(t);state.feedRaw=t;const n=(ft==='qual'?state.qualRoster:state.raceRoster).length;rep.push(`Данные гонки: загружены (${ft==='qual'?'квалификация':'гонка'}, пилотов ${n})`);}catch(e){rep.push('Данные гонки: не удалось загрузить — вставьте вручную ниже');}
-    try{const t=await fetchFeed(L.livePoints);state.pointsRaw=t;state.pointsByNum=parsePoints(t);rep.push('Очки пилотов: загружены');}catch(e){rep.push('Очки пилотов: не удалось загрузить — вставьте вручную ниже');}
-    state.actualCaution='';state.actualRet='';saveState(state);btn.textContent=old;btn.disabled=false;render();
-    alert(rep.join('\n'));
-  }},'⤓ Загрузить автоматически');
+    const btn=ev.target,old=btn.textContent;btn.textContent='Загрузка…';btn.disabled=true;
+    try{
+      const t=await fetchFeed(L.weekend);
+      state.weekendRaw=t;
+      applyWeekendFeed(t);
+      state.actualCaution='';state.actualRet='';
+      saveState(state);render();
+      alert(`Загружено: пилотов ${state.raceRoster.length}, стейджей ${JSON.parse(t).weekend_race&&JSON.parse(t).weekend_race[0]&&(JSON.parse(t).weekend_race[0].stage_results||[]).length}`);
+    }catch(e){btn.textContent=old;btn.disabled=false;alert('Ошибка загрузки: '+e.message);}
+  }},'⤓ Загрузить weekend-feed');
   src.appendChild(el('div',{class:'btnrow'},loadBtn));
 
   // manual paste
-  src.appendChild(el('label',{class:'flbl'},'Данные гонки — вставить вручную'));
-  src.appendChild(el('textarea',{class:'ta',placeholder:'Скопируйте содержимое ссылки выше и вставьте сюда',oninput:e=>{state.feedRaw=e.target.value;},onchange:e=>{state.feedRaw=e.target.value;if(state.feedRaw.trim()){try{applyFeed(state.feedRaw);state.actualCaution='';state.actualRet='';saveState(state);render();}catch(err){alert('Ошибка: '+err.message);}}}},state.feedRaw));
-  src.appendChild(el('label',{class:'flbl'},'Очки — вставить вручную'));
-  src.appendChild(el('textarea',{class:'ta',placeholder:'Скопируйте содержимое ссылки выше и вставьте сюда',oninput:e=>{state.pointsRaw=e.target.value;},onchange:e=>{state.pointsRaw=e.target.value;if(state.pointsRaw.trim()){try{state.pointsByNum=parsePoints(state.pointsRaw);saveState(state);render();}catch(err){alert('Ошибка: '+err.message);}}}},state.pointsRaw));
+  src.appendChild(el('label',{class:'flbl'},'Weekend Feed — вставить вручную'));
+  src.appendChild(el('textarea',{class:'ta',placeholder:'Скопируйте содержимое weekend-feed.json и вставьте сюда',oninput:e=>{state.weekendRaw=e.target.value;},onchange:e=>{state.weekendRaw=e.target.value;if(state.weekendRaw.trim()){try{applyWeekendFeed(state.weekendRaw);state.actualCaution='';state.actualRet='';saveState(state);render();}catch(err){alert('Ошибка: '+err.message);}}}},state.weekendRaw));
 
   // shared actual overrides
   const ov=el('div',{class:'params',style:'margin-top:10px;'});
@@ -443,43 +601,66 @@ function renderSources(root){
   .ta:focus{outline:none;border-color:var(--yellow);}
   .sub{font-size:11px;color:var(--dim);line-height:1.5;margin-top:8px;}
 
-  /* grid table */
-  .gt{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden;min-width:520px;}
-  .gc{background:var(--card);padding:7px 9px;font-size:12px;display:flex;align-items:center;min-height:38px;}
-  .ghead{background:var(--head);font-weight:700;color:#fff;font-size:13px;gap:6px;}
-  .glabelcell{color:var(--dim);font-size:11px;letter-spacing:.04em;}
-  .glabelcell.strong{color:#fff;font-weight:700;background:#23262e;}
-  .totallbl{background:#2a2d36;}
-  .spacer{min-height:8px;background:var(--bg);}
-  .pname{background:transparent;border:none;border-bottom:1px solid transparent;color:#fff;font-family:inherit;font-weight:700;font-size:13px;width:100%;padding:2px 0;}
-  .pname:focus{outline:none;border-bottom-color:var(--yellow);}
-  .xdel{background:transparent;border:none;color:var(--dim);font-size:16px;cursor:pointer;line-height:1;padding:0 2px;}
-  .xdel:hover{color:#e74c3c;}
-  .cellpick{flex-direction:column;align-items:stretch;gap:4px;padding:6px;}
-  .qpair{display:flex;justify-content:space-between;align-items:center;}
-  .qplace{font-size:12px;color:var(--dim);} .qpts{font-size:14px;font-weight:700;color:var(--yellow);}
-  .sumcell{justify-content:flex-end;font-weight:700;color:var(--yellow);font-size:15px;background:#23262e;}
-  .cellrace{justify-content:space-between;}
-  .rname{font-size:11px;color:#cfd3db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .rpts{font-size:14px;font-weight:700;color:var(--pts);margin-left:6px;}
-  .cellbonus{justify-content:space-between;gap:6px;}
-  .bpts{font-size:13px;font-weight:700;color:var(--pts);}
-  .fact{color:var(--yellow);font-size:10px;margin-left:6px;}
-  .totalcell{justify-content:flex-end;font-weight:700;color:var(--yellow);font-size:18px;background:#2a2d36;}
+  /* ---- participant table ---- */
+  .sumbar{display:flex;gap:14px;padding:4px 6px 10px;font-size:11px;color:var(--dim);}
+  .sumitem{letter-spacing:.04em;}
+  .fact-hd{color:var(--yellow);}
+  .tscroll{overflow-x:auto;border-radius:8px;border:1px solid var(--line);}
+  .ptbl{border-collapse:collapse;width:100%;min-width:960px;}
+  .ptbl thead tr{background:var(--head);}
+  .ptbl th{padding:7px 8px;font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--dim);font-weight:600;white-space:nowrap;border-bottom:1px solid var(--line);text-align:left;}
+  .th-rank{width:32px;text-align:center;}
+  .th-name{min-width:120px;}
+  .th-drv{min-width:118px;}
+  .th-n{width:68px;}
+  .th-mfg{width:90px;}
+  .th-pts{width:52px;text-align:right;}
+  .th-total{width:60px;text-align:right;}
+  .th-del{width:28px;}
 
-  /* combo */
-  .combo{position:relative;width:100%;}
-  .cinput{width:100%;background:var(--field);border:1px solid var(--line);border-radius:5px;color:#fff;font-family:inherit;font-size:12px;padding:6px 8px;}
-  .cinput:focus{outline:none;border-color:var(--yellow);}
-  .clist{position:absolute;top:100%;left:0;right:0;z-index:20;background:#11131a;border:1px solid var(--yellow);border-radius:6px;margin-top:2px;max-height:240px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.5);}
-  .citem{padding:7px 9px;font-size:12px;color:#e8e8ea;cursor:pointer;white-space:nowrap;}
+  .prow td{border-bottom:1px solid #21242c;padding:4px 6px;vertical-align:top;}
+  .prow.alt td{background:#1a1d24;}
+  .prow.p1 .td-total{color:var(--yellow);}
+  .prow:hover td{background:#22252e;}
+
+  .td-rank{text-align:center;color:var(--dim);font-size:12px;padding-top:8px;}
+  .prow.p1 .td-rank{font-size:15px;}
+  .td-name{padding-top:6px;}
+  .pname-c{background:transparent;border:none;border-bottom:1px solid transparent;color:#fff;font-family:inherit;font-size:12px;font-weight:600;width:100%;padding:2px 0;min-width:90px;}
+  .pname-c:focus{outline:none;border-bottom-color:var(--yellow);}
+
+  .td-drv{padding:3px 5px;}
+  .td-n{padding:4px 5px;vertical-align:middle;}
+  .td-mfg{padding:4px 5px;vertical-align:middle;}
+  .td-pts{text-align:right;font-size:13px;color:var(--pts);font-weight:600;padding-top:8px;}
+  .td-total{text-align:right;font-size:15px;font-weight:700;color:var(--pts);padding-top:6px;}
+  .td-del{text-align:center;vertical-align:middle;}
+
+  /* compact driver combo */
+  .combo-c{position:relative;}
+  .cinput-c{width:100%;background:var(--field);border:1px solid var(--line);border-radius:5px;color:#fff;font-family:inherit;font-size:11px;padding:5px 7px;min-width:0;}
+  .cinput-c:focus{outline:none;border-color:var(--yellow);}
+  .cmeta{font-size:9px;color:var(--dim);margin-top:2px;white-space:nowrap;letter-spacing:.02em;}
+
+  /* shared dropdown */
+  .clist{position:absolute;top:100%;left:0;min-width:200px;z-index:30;background:#11131a;border:1px solid var(--yellow);border-radius:6px;margin-top:2px;max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.6);}
+  .citem{padding:6px 9px;font-size:12px;color:#e8e8ea;cursor:pointer;white-space:nowrap;}
   .citem:hover{background:var(--head);}
   .citem.clear{color:var(--dim);border-bottom:1px solid var(--line);}
   .cempty{padding:8px;font-size:11px;color:var(--dim);}
-  .msel{background:var(--field);border:1px solid var(--line);border-radius:5px;color:#fff;font-family:inherit;font-size:12px;padding:6px 6px;flex:1 1 auto;min-width:0;}
+
+  /* prediction inputs */
+  .n-inp{width:52px;background:var(--field);border:1px solid var(--line);border-radius:5px;color:#fff;font-family:inherit;font-size:12px;padding:5px 4px;text-align:center;display:block;}
+  .n-inp:focus{outline:none;border-color:var(--yellow);}
+  .bpts-s{font-size:9px;color:var(--pts);font-weight:700;margin-top:2px;text-align:center;}
+  .qrank-auto{font-size:11px;color:var(--yellow);font-weight:700;text-align:center;}
+
+  .msel{background:var(--field);border:1px solid var(--line);border-radius:5px;color:#fff;font-family:inherit;font-size:11px;padding:5px 4px;width:100%;}
   .msel:focus{outline:none;border-color:var(--yellow);}
-  .pred{width:54px;background:var(--field);border:1px solid var(--line);border-radius:5px;color:#fff;font-family:inherit;font-size:13px;padding:6px;text-align:center;}
-  .pred:focus{outline:none;border-color:var(--yellow);}
+
+  .xdel{background:transparent;border:none;color:var(--dim);font-size:16px;cursor:pointer;line-height:1;padding:0 2px;}
+  .xdel:hover{color:#e74c3c;}
+
   .addrow{display:flex;gap:10px;justify-content:center;}
   .add{background:transparent;border:1px solid var(--yellow);color:var(--yellow);font-family:inherit;font-size:12px;font-weight:600;text-transform:uppercase;padding:9px 18px;border-radius:6px;cursor:pointer;}
   .add:hover{background:var(--yellow);color:#16181d;}
