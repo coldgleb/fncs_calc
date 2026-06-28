@@ -30,6 +30,7 @@ const DEFAULT={
   qualRoster:[], raceRoster:[], pointsByNum:{},
   cautionSegmentsRace:null, stageNumRace:null,
   weekendCautions:null, weekendRet:null,
+  sortByScore:false,                        // сортировка таблицы по итоговым очкам (по умолчанию выкл)
   actualCaution:'', actualRet:'',           // shared actuals (auto from feed, editable)
   participants:[newParticipant('Участник 1'),newParticipant('Участник 2')]
 };
@@ -303,7 +304,8 @@ function render(){
   const ec=effCaution(),er=effRet();
 
   const scores=computeAllScores(P);
-  const ranked=P.map((_,i)=>i);
+  let ranked=P.map((_,i)=>i);
+  if(state.sortByScore)ranked=ranked.slice().sort((a,b)=>scores[b].grand-scores[a].grand);
 
   // header
   root.appendChild(el('div',{class:'hd'},el('div',{class:'flag'}),
@@ -320,6 +322,10 @@ function render(){
   sumbar.appendChild(el('span',{class:'sumitem'},'Участников: '+P.length));
   if(ec!=null)sumbar.appendChild(el('span',{class:'sumitem fact-hd'},'Жёлтые: '+ec));
   if(er!=null)sumbar.appendChild(el('span',{class:'sumitem fact-hd'},'Сходы: '+er));
+  sumbar.appendChild(el('label',{class:'sortgl',title:'Сортировать строки по итоговым очкам'},
+    el('input',{type:'checkbox',...(state.sortByScore?{checked:'checked'}:{}),
+      onchange:e=>{state.sortByScore=e.target.checked;saveState(state);render();}}),
+    el('span',{},'Сортировка по очкам')));
   card.appendChild(sumbar);
 
   const wrap=el('div',{class:'tscroll'});
@@ -605,6 +611,8 @@ function renderSources(root){
   .sumbar{display:flex;gap:14px;padding:4px 6px 10px;font-size:11px;color:var(--dim);}
   .sumitem{letter-spacing:.04em;}
   .fact-hd{color:var(--yellow);}
+  .sortgl{margin-left:auto;display:flex;align-items:center;gap:6px;cursor:pointer;letter-spacing:.04em;user-select:none;}
+  .sortgl input{accent-color:var(--yellow);cursor:pointer;}
   .tscroll{overflow-x:auto;border-radius:8px;border:1px solid var(--line);}
   .ptbl{border-collapse:collapse;width:100%;min-width:960px;}
   .ptbl thead tr{background:var(--head);}
